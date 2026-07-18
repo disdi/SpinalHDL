@@ -265,6 +265,10 @@ public:
 
     Wrapper_${uniqueId}(const char * name, const char * wavePath, int seed){
       //contextp = new VerilatedContext;
+      // Clear any stale handle left by a previous simulation on this thread: Verilator's
+      // legacy time path (VerilatedContext::time() -> sc_time_stamp()) runs during model
+      // construction and must not read a freed wrapper.
+      simHandle${uniqueId} = nullptr;
       Verilated::randReset(2);
       Verilated::randSeed(seed);
       top = new V${config.toplevelName}();
@@ -320,12 +324,15 @@ ${    val signalInits = for((signal, id) <- config.signals.zipWithIndex) yield {
       top->final();
       delete top;
       //delete contextp;
+      if (simHandle${uniqueId} == this) simHandle${uniqueId} = nullptr;
     }
 
 };
 
 double sc_time_stamp () {
-  return simHandle${uniqueId}->time;
+  // Verilator >= 5.032 queries the legacy time callback from VerilatedContext::addModel()
+  // while the model is still being constructed, before simHandle${uniqueId} is set.
+  return simHandle${uniqueId} ? simHandle${uniqueId}->time : 0;
 }
 
 
