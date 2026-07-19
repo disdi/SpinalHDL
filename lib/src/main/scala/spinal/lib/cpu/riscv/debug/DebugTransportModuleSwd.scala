@@ -4,9 +4,9 @@ import spinal.core._
 import spinal.lib._
 
 /**
- * SWD transport for the RISC-V debug module (see fpga/SWD.md).
+ * SWD transport for the RISC-V debug module.
  *
- * This file will grow through the SWD.md phases:
+ * This file will grow through the SWD phases:
  *   - Phase 2A (this step): SwdPhy — the ARM ADI SW-DP line layer (wire protocol
  *     state machine), terminating in the decoded-transaction seam below.
  *   - Phase 2B: DP register file (DPIDR, CTRL/STAT, SELECT, RDBUFF, ABORT) behind the seam.
@@ -26,7 +26,7 @@ import spinal.lib._
  * Clocking: the component's implicit clock is SWCLK (probe-driven). The target samples
  * SWDIO on the rising edge and updates its own output on the rising edge, matching the
  * OpenOCD bitbang model (host sets data while SWCLK is low, samples target data while low).
- * SWDIO is exposed as i/o/oe — the tristate/IOBUF belongs at SoC/platform level (SWD.md 6.3).
+ * SWDIO is exposed as i/o/oe — the tristate/IOBUF belongs at SoC/platform level.
  */
 
 case class SwdDpCmd() extends Bundle {
@@ -163,6 +163,7 @@ case class SwdPhy() extends Component {
       cnt := cnt + 1
       when(cnt === 32) {
         state := EState.RELEASE
+        cnt := 0
       }
     }
     is(EState.WR_TRN) {                  // release the line, then one turnaround bit period
@@ -184,8 +185,18 @@ case class SwdPhy() extends Component {
       }
     }
     is(EState.RELEASE) {                 // turnaround back to host after a target-driven phase
+      // Two cycles: the last target-driven bit (ACK[2] or read parity) is still on the wire
+      // during cnt=0 because oData/oDrive are registered; cnt=1 is the turnaround proper, in
+      // which nobody drives. IDLE must not sample a start bit during that cycle -- a host
+      // that tristates SWDIO (OpenOCD does; the SWDIO pull-up is mandatory per ADI) leaves
+      // the line high there, which would otherwise be misread as a start bit and send the
+      // frame decoder into ERROR for the rest of the connection.
       oDrive := False
-      state := EState.IDLE
+      cnt := cnt + 1
+      when(cnt === 1) {
+        state := EState.IDLE
+        cnt := 0
+      }
     }
     is(EState.ERROR) {                   // protocol error: line released, headers ignored
       oDrive := False
@@ -211,7 +222,7 @@ case class SwdPhy() extends Component {
 case class SwdApCmd() extends Bundle {
   val rnw   = Bool()          // true = AP read, false = AP write
   val addr  = Bits(2 bits)    // AP register A[3:2]
-  val apSel = Bits(8 bits)    // SELECT[31:24]; the Phase 2D gateway decodes ADDR == 0
+  val apSel = Bits(8 bits)    // SELECT[31:24]; the Phase 2C gateway decodes ADDR == 0
   val wdata = Bits(32 bits)   // valid for writes only
 }
 
@@ -221,7 +232,7 @@ case class SwdApRsp() extends Bundle {
 }
 
 /**
- * Phase 2B: ADI SW-DP register file behind the SwdPhy seam (SWD.md Phase 2B).
+ * Phase 2B: ADI SW-DP register file behind the SwdPhy seam (Phase 2B).
  *
  * DP register map (SWD, A[3:2]):
  *   read : 00 DPIDR | 01 CTRL/STAT (DPBANKSEL==0; other banks RAZ) | 10 RESEND | 11 RDBUFF
@@ -234,9 +245,10 @@ case class SwdApRsp() extends Bundle {
  *   - OK   : everything else. The access itself only happens on OK.
  *
  * Scope limits: ORUNDETECT is stored but overrun detection is not implemented (STICKYORUN
- * and STICKYCMP are never set by hardware, only clearable); power-up ACKs mirror the REQs
- * (FPGA integration per SWD.md Phase 2D); DPIDR default is a placeholder with a non-ARM
- * DESIGNER field - set the real value per Phase 2D before host-tool integration.
+ * and STICKYCMP are never set by hardware, only clearable); power-up ACKs mirror the REQs;
+ * DPIDR default is a placeholder with a non-ARM
+ * DESIGNER field - identification rules are Phase 2C; set the real value before
+ * host scripts hard-code it.
  */
 case class SwdDp(dpidr : BigInt = BigInt("0BA11AAB", 16)) extends Component {
   val io = new Bundle {
@@ -322,18 +334,21 @@ case class SwdDp(dpidr : BigInt = BigInt("0BA11AAB", 16)) extends Component {
     last.addrReg      := addr
   }
 
-  // AP completion
+  // AP completion. Only a completion we are actually waiting for is honored — an
+  // unsolicited rsp event (e.g. a CDC-boot glitch on the crossing) must not set
+  // stickies or touch the read buffer.
   when(io.ap.rsp.valid) {
-    apBusy := False
     when(apDiscard) {
-      apDiscard := False
-    } otherwise {
+      apDiscard := False                         // DAPABORT'd access: swallow its completion
+      apBusy := False
+    } elsewhen(apBusy) {
+      apBusy := False
       when(io.ap.rsp.payload.error) {
         stickyErr := True
       } elsewhen(apWasRead) {
         rdBuffer := io.ap.rsp.payload.data
       }
-    }
+    }                                            // otherwise: unsolicited — ignore
   }
 
   // Write commit (fires after the WDATA phase; absent on WAIT/FAULT frames)
@@ -408,4 +423,137 @@ case class SwdPhyDp(dpidr : BigInt = BigInt("0BA11AAB", 16)) extends Component {
   dp.io.dp.wr   << phy.io.dp.wr
   io.ap.cmd     << dp.io.ap.cmd
   dp.io.ap.rsp  << io.ap.rsp
+}
+
+/**
+ * Phase 2C: RISC-V DMI gateway AP + SWCLK<->debug clock crossing (Phase 2C).
+ *
+ * Implements the Phase 2C single-AP register map behind the 2B AP seam:
+ *   A[3:2]=00  AP_IDR       RO  identification constant (not a MEM-AP)
+ *   A[3:2]=01  DMI_ADDR     RW  latch the 7-bit DMI word address (readable back)
+ *   A[3:2]=10  DMI_DATA     RW  perform a DebugBus transaction at DMI_ADDR
+ *   A[3:2]=11  POSTED_READ  RO  last completed DMI read result (RDBUFF semantics)
+ *
+ * AP_IDR / DMI_ADDR / POSTED_READ complete locally in one SWCLK cycle; DMI_DATA crosses
+ * to the debug clock domain with the exact ccToggle/toStream/m2sPipe pattern used by the
+ * JTAG DTM (DebugTransportModuleJtag.systemLogic). The DM responds on DebugBus.rsp for
+ * both reads and writes (DebugBusSlaveFactory stages every cmd), so AP writes complete on
+ * the crossed response too — the DP's busy/WAIT logic (2B) covers the whole flight time,
+ * including DebugBus.cmd backpressure. SELECT.APSEL is not decoded (single-AP design).
+ */
+class SwdDmiGateway(p : DebugTransportModuleParameter,
+                    swdCd : ClockDomain,
+                    debugCd : ClockDomain,
+                    apIdr : BigInt) extends Area {
+  import p._
+
+  val swdLogic = swdCd on new Area {
+    val apCmd = Flow(SwdApCmd())             // driven by the parent from SwdPhyDp
+    val apRsp = Flow(SwdApRsp())
+
+    val dmiAddr  = Reg(UInt(addressWidth bits)) init(0)
+    val lastRead = Reg(Bits(32 bits)) init(0)
+
+    val dmiCmd = Flow(DebugCmd(addressWidth))
+    val dmiRsp = Flow(DebugRsp())            // driven by systemLogic (crossed back)
+
+    val isDmiData = apCmd.payload.addr === B"10"
+    val localHit  = apCmd.valid && !isDmiData
+
+    // AP_IDR / DMI_ADDR / POSTED_READ complete locally one cycle after the launch.
+    val local = new Area {
+      val valid = RegNext(localHit) init(False)
+      val data  = Reg(Bits(32 bits))
+      when(localHit) {
+        data := 0
+        switch(apCmd.payload.addr) {
+          is(B"00") { data := B(apIdr, 32 bits) }
+          is(B"01") {
+            when(apCmd.payload.rnw) {
+              data := B(0, (32 - addressWidth) bits) ## dmiAddr.asBits
+            } otherwise {
+              dmiAddr := apCmd.payload.wdata(addressWidth - 1 downto 0).asUInt
+            }
+          }
+          is(B"11") { data := lastRead }     // writes to RO registers: OK, no effect
+        }
+      }
+    }
+
+    val dmiWasRead = Reg(Bool())
+    val dmiPending = Reg(Bool()) init(False)     // a DebugBus access is in flight
+    dmiCmd.valid   := apCmd.valid && isDmiData
+    dmiCmd.write   := !apCmd.payload.rnw
+    dmiCmd.address := dmiAddr
+    dmiCmd.data    := apCmd.payload.wdata
+    when(dmiCmd.valid) {
+      dmiWasRead := apCmd.payload.rnw
+      dmiPending := True
+    }
+
+    // Only honor a response we are waiting for — a spurious rsp event out of the
+    // clock crossing (e.g. boot-time toggle mismatch) must not complete anything.
+    val dmiRspHit = dmiRsp.valid && dmiPending
+    when(dmiRspHit) {
+      dmiPending := False
+      when(dmiWasRead && !dmiRsp.error) { lastRead := dmiRsp.data }
+    }
+
+    apRsp.valid         := local.valid || dmiRspHit
+    apRsp.payload.error := dmiRspHit && dmiRsp.error
+    apRsp.payload.data  := local.valid ? local.data | dmiRsp.data
+  }
+
+  val systemLogic = debugCd on new Area {
+    val bus = DebugBus(addressWidth)
+    val cmd = swdLogic.dmiCmd.ccToggle(
+      pushClock = swdCd,
+      popClock = debugCd,
+      withOutputM2sPipe = false
+    ).toStream.m2sPipe(crossClockData = true, holdPayload = true)
+    bus.cmd << cmd
+    swdLogic.dmiRsp << bus.rsp.ccToggle(
+      pushClock = debugCd,
+      popClock = swdCd,
+      // The SWCLK domain is BOOT-reset (no reset wire exists on the 2-wire interface);
+      // a buffered reset cannot be synthesized into it — pop-side regs boot-init instead.
+      withOutputBufferedReset = false
+    )
+  }
+}
+
+/**
+ * The complete SWD transport: SWD pins -> SwdPhy -> SwdDp -> DMI gateway -> DebugBus.
+ * SWD-side logic runs on the probe-driven SWCLK (BOOT reset: no reset wire on the pins —
+ * line reset is the protocol-level reset); the DebugBus side runs on debugCd.
+ * Counterpart of DebugTransportModuleJtagTap for the SWD wire protocol.
+ */
+case class DebugTransportModuleSwd(p : DebugTransportModuleParameter,
+                                   debugCd : ClockDomain,
+                                   dpidr : BigInt = BigInt("0BA11AAB", 16),
+                                   apIdr : BigInt = BigInt("74726976", 16)) extends Component {
+  val io = new Bundle {
+    val swd = new Bundle {
+      val swclk = in Bool()
+      val swdio = new Bundle {
+        val i  = in  Bool()
+        val o  = out Bool()
+        val oe = out Bool()
+      }
+    }
+    val bus = master(DebugBus(p.addressWidth))
+  }
+
+  val swdCd = ClockDomain(clock = io.swd.swclk, config = ClockDomainConfig(resetKind = BOOT))
+
+  val core = swdCd on SwdPhyDp(dpidr)
+  core.io.swdio.i := io.swd.swdio.i
+  io.swd.swdio.o  := core.io.swdio.o
+  io.swd.swdio.oe := core.io.swdio.oe
+
+  val gateway = new SwdDmiGateway(p, swdCd, debugCd, apIdr)
+  gateway.swdLogic.apCmd << core.io.ap.cmd
+  core.io.ap.rsp << gateway.swdLogic.apRsp
+
+  io.bus <> gateway.systemLogic.bus
 }

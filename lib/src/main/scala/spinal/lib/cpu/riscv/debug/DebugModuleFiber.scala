@@ -62,4 +62,18 @@ class DebugModuleFiber() extends Area{
     thread.logic.io.ctrl <> logic.io.bus
     val instruction = logic.io.instruction.toIo
   }
+
+  // SWD transport (SWD.md Phase 2C). One transport per build — do not combine with
+  // withJtagTap()/withJtagInstruction() (direct io.ctrl connection, no arbitration).
+  def withSwdTransport(dpidr : BigInt = BigInt("0BA11AAB", 16),
+                       apIdr : BigInt = BigInt("74726976", 16)) = Fiber build new Area {
+    val logic = DebugTransportModuleSwd(
+      p = thread.p,
+      debugCd = thread.logic.clockDomain,
+      dpidr = dpidr,
+      apIdr = apIdr
+    )
+    thread.logic.io.ctrl <> logic.io.bus
+    val swd = logic.io.swd.toIo
+  }
 }
